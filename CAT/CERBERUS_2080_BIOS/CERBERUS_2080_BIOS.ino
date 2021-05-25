@@ -9,8 +9,9 @@
 /**      Code distributed under license     **/
 /*********************************************/
 
+/** 0xFE BIOS Enhancement by Andy Toone     **/
 /** Release 1.0                  **/
-/** Latest update: 29-April-2021 **/
+/** Latest update: 25-May-2021 **/
 
 /** Provided AS-IS, without guarantees of any kind                        **/
 /** This is NOT a commercial product as has not been exhaustively tested  **/
@@ -23,10 +24,15 @@
 #include <SD.h>
 /** The two libraries above are built into the arduino IDE  **/
 #include <PS2Keyboard.h>
+
 /** The library above must be manually included in the IDE. **/
 /** For more information about this PS2Keyboard library:    **/
 /** http://www.arduino.cc/playground/Main/PS2Keyboard       **/
 /** http://www.pjrc.com/teensy/td_libs_PS2Keyboard.html     **/
+/** Note that the Arduino managed library is not the latest **/
+/** Install from the GitHub project in order to build       **/
+
+#include <TimerOne.h>
 
 /** Pinout below defined as per Arduino Uno pin IDs **/
 /** The next pins go to SPACER **/
@@ -78,6 +84,7 @@ volatile char previousEditLine[38];
 volatile byte pos = 1;              /** Position in edit line currently occupied by cursor **/
 volatile bool mode = false;         /** false = 6502 mode, true = Z80 mode **/
 volatile bool cpurunning = false;   /** true = CPU is running, CAT should not use the buses **/
+volatile bool gameMode = false;   /** true = CPU is running, CAT should not use the buses **/
 volatile bool fast = false;         /** true = 8 MHz CPU clock, false = 4 MHz CPU clock **/
 
 void(* resetFunc) (void) = 0;       /** Software reset fuction at address 0 **/
@@ -115,8 +122,9 @@ void setup() {
   resetCPUs();
   /** Clear edit line **/
   clearEditLine();
-  for(byte i=0; i<38; i++) previousEditLine[i] = editLine[i];
-  
+  storePreviousLine();
+  Serial.begin(9600);
+   
   /** Initialize keyboard library **/
   keyboard.begin(DataPin, IRQpin);
   /** Now access uSD card and load character definitions so we can put something on the screen **/
@@ -187,24 +195,29 @@ void loop() {
   char ascii; /** Stores ascii value of key pressed **/
   byte i;     /** Just a counter **/
   /** Wait for a key to be pressed, then take it from there... **/
-  if (keyboard.available()) {
-    ascii = keyboard.read();        /** Read key pressed **/
-    tone(SOUND, 750, 5);            /** Clicking sound for auditive feedback to key presses **/
-    if (!cpurunning) cprintStatus(STATUS_DEFAULT);/** Update status bar **/
+  if (keyboard.available() || Serial.available()) {
+    if( keyboard.available() ) {
+      ascii = keyboard.read();        /** Read key pressed **/
+      tone(SOUND, 750, 5);            /** Clicking sound for auditive feedback to key presses **/
+      if (!cpurunning) cprintStatus(STATUS_DEFAULT);/** Update status bar **/
+    }
+    else {
+      while( Serial.available() ) {
+        ascii = Serial.read();
+        if( ascii == PS2_ENTER || cpurunning ) {
+          break;
+        }
+        editLine[pos] = ascii;  /** Put new character in current cursor position **/
+        if (pos < 37) pos++;    /** Update cursor position **/
+        editLine[pos] = 0;
+        ascii = 0;
+      }
+    }
     if (ascii == PS2_ENTER) {       /** This happens if ENTER has been pressed... **/
       if (!cpurunning) enter();
     } else if (ascii == PS2_ESC) {  /** This happens if ESC has been pressed... and so on... **/
       if (cpurunning) {             /** If a CPU has been running, do the below to quit properly **/
-        digitalWrite(CPURST, HIGH); /** Reset the CPU to bring its output signals back to original states **/ 
-        digitalWrite(CPUGO, LOW);   /** Tristate its buses to high-Z **/
-        delay(50);                   /** Give it some time **/
-        digitalWrite(CPURST, LOW);  /** Finish reset cycle **/
-        cpurunning = false;         /** Reset this flag **/
-        load("chardefs.bin","0xf000", true);  /** Silently reset the character definitions in case the CPU changed them **/
-        ccls();                     /** Clear screen completely **/
-        cprintFrames();             /** Reprint the wire frame in case the CPU code messed with it **/
-        cprintStatus(STATUS_DEFAULT);            /** Update status bar **/
-        clearEditLine();            /** Clear and display the edit line **/
+        stopCode();
       }
     } else if (ascii == PS2_PAGEDOWN) {
     } else if (ascii == PS2_PAGEUP) {
@@ -227,7 +240,7 @@ void loop() {
         cprintEditLine();   /** Print the updated edit line **/
       }
     /*********************************************************************************************/
-    } else {                /** This is the 'default' condition **/
+    } else if( ascii != 0 ){    /** This is the 'default' condition **/
       if (!cpurunning) {        /** If a CPU is not running... **/
         editLine[pos] = ascii;  /** Put new character in current cursor position **/
         if (pos < 37) pos++;    /** Update cursor position **/
@@ -235,11 +248,18 @@ void loop() {
         cprintEditLine();       /** Print the updated edit line **/
       } else {                      /** Now, if a CPU is running... **/
         digitalWrite(CPUGO, LOW);   /** Pause the CPU and tristate its buses to high-Z **/
+        byte mode = cpeek(0x0200);
         cpoke(0x0201, ascii);       /** Put token code of pressed key in the CPU's mailbox, at 0x0201 **/
-        cpoke(0x0200, 0x01);        /** Flag that there is new mail for the CPU waiting at the mailbox **/
+        if( mode != 0xFE ) {
+           cpoke(0x0200, 0x01);        /** Flag that there is new mail for the CPU waiting at the mailbox **/
+        }
         digitalWrite(CPUGO, HIGH);  /** Let the CPU go **/
         digitalWrite(CPUIRQ, HIGH); /** Trigger an interrupt **/
         digitalWrite(CPUIRQ, LOW);
+        if( mode == 0xFE ) {
+          /** switch to 'game' mode **/
+          enterGameMode(); 
+        }
       }
     }
     /*********************************************************************************************/
@@ -255,18 +275,43 @@ void enter() {  /** Called when the user presses ENTER, unless a CPU program is 
   String nextWord, nextNextWord, nextNextNextWord; /** General-purpose strings **/
   nextWord = getNextWord(true);     /** Get the first word in the edit line **/
   nextWord.toLowerCase();           /** Ignore capitals **/
+  if( nextWord.length() == 0 ) {    /** Ignore empty line **/
+    Serial.println(F("OK"));
+    return;
+  }
   /** MANUAL ENTRY OF OPCODES AND DATA INTO MEMORY *******************************************/
   if ((nextWord.charAt(0) == '0') && (nextWord.charAt(1) == 'x')) { /** The user is entering data into memory **/
     nextWord.remove(0,2);                       /** Removes the "0x" at the beginning of the string to keep only a HEX number **/
     addr = strtol(nextWord.c_str(), NULL, 16);  /** Converts to HEX number type **/
     nextNextWord = getNextWord(false);          /** Get next byte **/
+    byte chkA = 1;
+    byte chkB = 0;
     while (nextNextWord != "") {                /** For as long as user has typed in a byte, store it **/
-      data = strtol(nextNextWord.c_str(), NULL, 16);/** Converts to HEX number type **/
-      cpoke(addr, data);
-      addr++;
+      if(nextNextWord.charAt(0) != '#') {
+        data = strtol(nextNextWord.c_str(), NULL, 16);/** Converts to HEX number type **/
+        while( cpeek(addr) != data ) {          /** Serial comms may cause writes to be missed?? **/
+          cpoke(addr, data);
+        }
+        chkA += data;
+        chkB += chkA;
+        addr++;
+      }
+      else {
+        nextNextWord.remove(0,1);
+        addr = strtol(nextNextWord.c_str(), NULL, 16);
+        if( addr != ((chkA << 8) | chkB) ) {
+          cprintString(28, 26, nextWord);
+          tone(SOUND, 50, 50);
+        }
+      }
       nextNextWord = getNextWord(false);  /** Get next byte **/
     }
     cprintStatus(STATUS_READY);
+    cprintString(28, 27, nextWord);
+    Serial.print(nextWord);
+    Serial.print(' ');
+    Serial.println((uint16_t)((chkA << 8) | chkB), HEX);
+    
   /** LIST ***********************************************************************************/
   } else if (nextWord == F("list")) {     /** Lists contents of memory in compact format **/
     cls();
@@ -340,7 +385,7 @@ void enter() {  /** Called when the user presses ENTER, unless a CPU program is 
   /** ALL OTHER CASES ***********************************************************************/
   } else cprintStatus(STATUS_UNKNOWN_COMMAND);
   if (!cpurunning) {
-    for (i = 0; i < 38; i++) previousEditLine[i] = editLine[i]; /** Store edit line just executed **/
+    storePreviousLine();
     clearEditLine();                   /** Reset edit line **/
   }
 }
@@ -463,6 +508,68 @@ void runCode() {
   digitalWrite(CPUGO, HIGH);  /** Enable CPU buses and clock **/
   delay(50);
   digitalWrite(CPURST, LOW);  /** CPU should now initialize and then go to its reset vector **/
+}
+
+void stopCode() {
+    cpurunning = false;         /** Reset this flag **/
+    Timer1.detachInterrupt();
+    digitalWrite(CPURST, HIGH); /** Reset the CPU to bring its output signals back to original states **/ 
+    digitalWrite(CPUGO, LOW);   /** Tristate its buses to high-Z **/
+    delay(50);                   /** Give it some time **/
+    digitalWrite(CPURST, LOW);  /** Finish reset cycle **/
+
+    load("chardefs.bin","0xf000", true);  /** Silently reset the character definitions in case the CPU changed them **/
+    ccls();                     /** Clear screen completely **/
+    cprintFrames();             /** Reprint the wire frame in case the CPU code messed with it **/
+    cprintStatus(STATUS_DEFAULT);            /** Update status bar **/
+    clearEditLine();            /** Clear and display the edit line **/
+}
+
+
+/**
+ * Keyboard circular buffer is 16 bytes at 0xFE00
+ * The next write position, writeIndex is at 0xFE10, with a value of 0-F
+ * The current read position, readIndex is at 0xFE11, with a value of 0-F
+ * The CPU can read a byte if readIndex != writeIndex
+ * The BIOS can write a byte if writeIndex+1 != readIndex
+ */
+void enterGameMode() {
+  Timer1.initialize(20000);
+  Timer1.attachInterrupt(cpuInterrupt); // Interrupt every 0.02 seconds - 50Hz
+  gameMode = true;
+    
+  while(cpurunning && gameMode) {
+      uint8_t s = keyboard.readScanCode();
+      if( !s ) continue;
+
+      digitalWrite(CPUGO, LOW);   /** Pause the CPU and tristate its buses to high-Z **/
+      byte currWrite = cpeek(0xFE10);
+      byte nextWrite = (currWrite+1)&0x0F;
+      byte readIndex  = cpeek(0xFE11)&0x0F;
+      
+      if( nextWrite != readIndex ) {
+        cpoke(0xFE00+currWrite, s);
+        cpoke(0xFE10, nextWrite);
+      }
+
+      byte mode = cpeek(0x0200);
+      if( mode != 0xFE ) {
+        gameMode = false;
+      }
+      digitalWrite(CPUGO, HIGH);
+          
+      if( s == 0x76 ) {
+        stopCode();
+      }
+  }
+  Timer1.detachInterrupt();
+}
+
+void cpuInterrupt(void) {
+  if( cpurunning ) {
+    digitalWrite(CPUIRQ, HIGH); /** Trigger an interrupt **/
+    digitalWrite(CPUIRQ, LOW);
+  }
 }
 
 void dir() {
@@ -589,50 +696,61 @@ void clearEditLine() {
   cprintEditLine();
 }
 
+void storePreviousLine() {
+  for (byte i = 0; i < 38; i++) previousEditLine[i] = editLine[i]; /** Store edit line just executed **/
+}
+
 void cprintStatus(byte status) {
-  if( status == STATUS_BOOT ) {
-    /** REMEMBER: The macro "F()" simply tells the compiler to put the string in code memory, so to save dynamic memory **/
-    cprintString(2, 27, F("        Here we go! Hang on...        "));
-  }
-  else if( status == STATUS_READY ) {
-    cprintString(2, 27, F("            Alright, done!            "));
-  }
-  else if( status == STATUS_UNKNOWN_COMMAND ) {
-    cprintString(2, 27, F("      Darn, unrecognized command      "));
-    tone(SOUND, 50, 150);
-  }
-  else if( status == STATUS_NO_FILE ) {
-    cprintString(2, 27, F("   Oops, file doesn't seem to exist   "));
-    tone(SOUND, 50, 150);
-  }
-  else if( status == STATUS_CANNOT_OPEN ) {
-    cprintString(2, 27, F("     Oops, couldn't open the file     "));
-    tone(SOUND, 50, 150);
-  }
-  else if( status == STATUS_MISSING_OPERAND ) {
-    cprintString(2, 27, F("      Oops, missing an operand!!      "));
-    tone(SOUND, 50, 150);
-  }
-  else if( status == STATUS_SCROLL_PROMPT ) {
-    cprintString(2, 27, F("  Press a key to scroll, ESC to stop  "));
-  }
-  else if( status == STATUS_FILE_EXISTS ) {
-    cprintString(2, 27, F("       The file already exists!       "));
-  }
-  else if( status == STATUS_ADDRESS_ERROR ) {
-    cprintString(2, 27, F("     Oops, invalid address range!     "));
-  }
-  else if( status == STATUS_POWER ) {
-    cprintString(2, 27, F("   Feel the power of Dutch design!!   "));
-  }
-  else {
-      cprintString(2, 27, F("      CERBERUS 2081: "));
+  switch( status ) {
+    case STATUS_BOOT:
+      /** REMEMBER: The macro "F()" simply tells the compiler to put the string in code memory, so to save dynamic memory **/
+      center(F("Here we go! Hang on..."));
+      cprintString(30, 25, F("0xFE v1.0"));
+      break;
+    case STATUS_READY:
+      center(F("Alright, done!"));
+      break;
+    case STATUS_UNKNOWN_COMMAND:
+      center(F("Darn, unrecognized command"));
+      tone(SOUND, 50, 150);
+      break;
+    case STATUS_NO_FILE:
+      center(F("Oops, file doesn't seem to exist"));
+      tone(SOUND, 50, 150);
+      break;
+    case STATUS_CANNOT_OPEN:
+      center(F("Oops, couldn't open the file"));
+      tone(SOUND, 50, 150);
+      break;
+    case STATUS_MISSING_OPERAND:
+      center(F("Oops, missing an operand!!"));
+      tone(SOUND, 50, 150);
+      break;
+    case STATUS_SCROLL_PROMPT:
+      center(F("Press a key to scroll, ESC to stop"));
+      break;
+    case STATUS_FILE_EXISTS:
+      center(F("The file already exists!"));
+      break;
+    case STATUS_ADDRESS_ERROR:
+      center(F("Oops, invalid address range!"));
+      break;
+    case STATUS_POWER:
+      center(F("Feel the power of Dutch design!!"));
+      break;
+    default:
+      cprintString(2, 27, F("      CERBERUS 2080: "));
       if (mode) cprintString(23, 27, F(" Z80, "));
       else cprintString(23, 27, F("6502, "));
       if (fast) cprintString(29, 27, F("8 MHz"));
       else cprintString(29, 27, F("4 MHz"));
       cprintString(34, 27, F("     "));
   }
+}
+
+void center(String text) {
+  clearLine(27);
+  cprintString(2+(38-text.length())/2, 27, text);
 }
 
 void playJingle() {
@@ -652,10 +770,14 @@ void playJingle() {
 
 void cls() {
   /** This clears the screen only WITHIN the main frame **/
-  unsigned int x;
   unsigned int y;
   for (y = 2; y <= 25; y++)
-    for (x = 2; x <= 39; x++)
+    clearLine(y);
+}
+
+void clearLine(byte y) {
+  unsigned int x;
+  for (x = 2; x <= 39; x++)
       cprintChar(x, y, 32);
 }
 
