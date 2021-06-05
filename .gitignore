@@ -1,0 +1,9 @@
+CPLD/*.doc
+CPLD/*.io
+CPLD/*.pdf
+CPLD/*.pin
+CPLD/*.sim
+CPLD/*.tt2
+CPLD/*.tt3
+CPLD/*.abs
+CPLD/*.chn
