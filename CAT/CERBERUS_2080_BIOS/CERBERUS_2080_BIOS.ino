@@ -42,7 +42,8 @@
 #define AOE A2    /** Address Output Enable, pin 25 on CAT **/
 #define RW A1     /** Memory Read/!Write, pin 24 on CAT **/
 #define LD A0     /** Latch Data, pin 23 on CAT **/
-#define CPUSLC 5  /** CPU SeLeCt, pin 11 on CAT **/
+/*#define CPUSLC 5*/  /** CPU SeLeCt, pin 11 on CAT **/
+#define CPUTOCAT 5 /** CPU to CAT communication **/
 #define CPUIRQ 6  /** CPU Interrupt ReQuest, pin 12 on CAT **/
 #define CPUGO 7   /** CPU Go/!Halt, pin 13 on CAT **/
 #define CPURST 8  /** CPU ReSeT, pin 14 on CAT **/
@@ -102,7 +103,7 @@ void setup() {
   pinMode(CPUSPD, OUTPUT);
   pinMode(KCLK, INPUT_PULLUP);      /** But here we need CAT's internal pull-up resistor **/
   pinMode(KDAT, INPUT_PULLUP);      /** And here too **/
-  pinMode(CPUSLC, OUTPUT);
+  pinMode(CPUTOCAT, INPUT);
   pinMode(CPUIRQ, OUTPUT);
   pinMode(CPUGO, OUTPUT);
   pinMode(CPURST, OUTPUT);
@@ -114,7 +115,6 @@ void setup() {
   digitalWrite(LD, LOW);
   digitalWrite(SC, LOW);
   digitalWrite(CPUSPD, LOW);
-  digitalWrite(CPUSLC, LOW);
   digitalWrite(CPUIRQ, LOW);
   digitalWrite(CPUGO, LOW);
   digitalWrite(CPURST, LOW);
@@ -330,26 +330,19 @@ void enter() {  /** Called when the user presses ENTER, unless a CPU program is 
   /** 6502 ***********************************************************************************/
   } else if (nextWord == F("6502")) {     /** Switches to 6502 mode **/
     mode = false;
-    digitalWrite(CPUSLC, LOW);            /** Tell CAT of the new mode **/
     cprintStatus(STATUS_READY);
-  /** Z80 ***********************************************************************************/
-  } else if (nextWord == F("z80")) {      /** Switches to Z80 mode **/
-    mode = true;
-    digitalWrite(CPUSLC, HIGH);           /** Tell CAT of the new mode **/
-    cprintStatus(STATUS_READY);
-  /** RESET *********************************************************************************/
   } else if (nextWord == F("reset")) {
     resetFunc();                          /** This resets CAT and, therefore, the CPUs too **/
   /** FAST **********************************************************************************/
   } else if (nextWord == F("fast")) {     /** Sets CPU clock at 8 MHz **/
-    digitalWrite(CPUSPD, HIGH);
-    fast = true;
-    cprintStatus(STATUS_READY);
+    //digitalWrite(CPUSPD, HIGH);
+    //fast = true;
+    //cprintStatus(STATUS_READY);
   /** SLOW **********************************************************************************/
   } else if (nextWord == F("slow")) {     /** Sets CPU clock at 4 MHz **/
-    digitalWrite(CPUSPD, LOW);
-    fast = false;
-    cprintStatus(STATUS_READY);
+    //digitalWrite(CPUSPD, LOW);
+    //fast = false;
+    //cprintStatus(STATUS_READY);
   /** DIR ***********************************************************************************/
   } else if (nextWord == F("dir")) {      /** Lists files on uSD card **/
     dir();
@@ -838,21 +831,13 @@ unsigned int addressTranslate (unsigned int virtualAddress) {
 
 void resetCPUs() {            /** Self-explanatory **/
   digitalWrite(CPURST, LOW);
-  digitalWrite(CPUSLC, LOW);  /** First reset the 6502 **/
+  //digitalWrite(CPUSLC, LOW);  /** First reset the 6502 **/
   digitalWrite(CPUGO, HIGH);
   delay(50);
   digitalWrite(CPURST, HIGH);
   digitalWrite(CPUGO, LOW);
   delay(50);
   digitalWrite(CPURST, LOW);
-  digitalWrite(CPUSLC, HIGH); /** Now reset the Z80 **/
-  digitalWrite(CPUGO, HIGH);
-  delay(50);
-  digitalWrite(CPURST, HIGH);
-  digitalWrite(CPUGO, LOW);
-  delay(50);
-  digitalWrite(CPURST, LOW);
-  if (!mode) digitalWrite(CPUSLC, LOW);
 }
 
 byte readShiftRegister() {
